@@ -8,3 +8,7 @@ build/
 .scraper_progress.json
 images/
 logs/
+
+# Scraper runtime files
+.scraper_progress.json
+.scraper_tracking.json

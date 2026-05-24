@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Equalite Product Scraper - Main Entry Point.
+"""Equalite Product Scraper — Main Entry Point.
 
-Scrapes all products from Equalite.nl, generates SigLIP embeddings,
-and imports everything into Supabase.
+Scrapes all products from Equalite.nl, compares against existing DB records,
+generates SigLIP embeddings only when needed, batch upserts, removes stale
+products, and prints a detailed run summary.
 
 Usage:
-    python scraper.py                     # Full scrape
-    python scraper.py --skip-embeddings   # Scrape without embeddings
-    python scraper.py --resume            # Resume from progress file
-    python scraper.py --limit 10          # Scrape only 10 products
-    python scraper.py --skip-existing     # Skip products already in DB
+    python scraper.py                          # Full smart scrape
+    python scraper.py --skip-embeddings        # Skip embeddings entirely
+    python scraper.py --resume                 # Resume from progress file
+    python scraper.py --limit 10               # Scrape only 10 products
 """
 
 import argparse
@@ -19,47 +19,125 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from tqdm import tqdm
 
 from src.collector import scrape_all_product_urls
-from src.database import DatabaseManager
+from src.database import DatabaseManager, ProductStatus
 from src.embeddings import (
     generate_image_embedding,
     generate_text_embedding,
 )
 from src.product import scrape_product
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("scraper")
 
 # Suppress verbose library logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("supabase").setLevel(logging.WARNING)
-logging.getLogger("PIL").setLevel(logging.WARNING)
-logging.getLogger("transformers").setLevel(logging.WARNING)
+for lib in ["httpx", "urllib3", "supabase", "PIL", "transformers"]:
+    logging.getLogger(lib).setLevel(logging.WARNING)
 
-# Progress file for resuming
+SOURCE_NAME = "scraper-equalite"
 PROGRESS_FILE = ".scraper_progress.json"
+TRACKING_FILE = ".scraper_tracking.json"
 
-BATCH_SIZE = 5  # Number of products to process before saving progress
+# Batch / delays
+DB_BATCH_SIZE = 50          # products per database batch upsert
+PROGRESS_SAVE_INTERVAL = 50 # save progress every N products
+EMBEDDING_DELAY = 0.5       # seconds between embedding generations
 
+
+# ------------------------------------------------------------------ #
+# Tracking file (stale product detection)
+# ------------------------------------------------------------------ #
+
+def load_tracking() -> Dict[str, Any]:
+    """Load the tracking file that records which products were seen each run.
+
+    Schema:
+    {
+        "seen": {"<product_url>": "<last_seen_iso_timestamp>", ...},
+        "missed": {"<product_url>": <consecutive_miss_count>, ...}
+    }
+    """
+    if os.path.exists(TRACKING_FILE):
+        try:
+            with open(TRACKING_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            logger.warning("Failed to load tracking file, starting fresh")
+    return {"seen": {}, "missed": {}}
+
+
+def save_tracking(tracking: Dict[str, Any]):
+    """Persist the tracking file."""
+    with open(TRACKING_FILE, "w") as f:
+        json.dump(tracking, f, indent=2)
+
+
+def update_tracking(
+    tracking: Dict[str, Any],
+    seen_urls: Set[str],
+    all_source_urls_in_db: Set[str],
+) -> Tuple[List[str], List[str]]:
+    """Update tracking data based on which URLs were seen this run.
+
+    Returns ``(freshly_missed, to_delete)``:
+    * ``freshly_missed`` — URLs that were NOT seen this run (missed count increased).
+    * ``to_delete`` — URLs whose missed count reached >= 2 and should be deleted.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    seen = tracking.get("seen", {})
+    missed = tracking.get("missed", {})
+
+    # Mark all seen URLs as seen (reset missed count)
+    for url in seen_urls:
+        seen[url] = now
+        missed.pop(url, None)
+
+    # Find which previously-seen products were NOT seen this run
+    freshly_missed_entries: List[Tuple[str, int]] = []
+    to_delete: List[str] = []
+
+    for url in list(seen.keys()):
+        if url not in seen_urls:
+            # Product was seen before but not this run
+            current_miss = missed.get(url, 0) + 1
+            missed[url] = current_miss
+            freshly_missed_entries.append((url, current_miss))
+
+    # Mark products for deletion after 2 consecutive misses
+    for url in list(missed.keys()):
+        if missed[url] >= 2 and url in all_source_urls_in_db:
+            to_delete.append(url)
+
+    # Clean up — remove tracking entries for deleted products
+    for url in to_delete:
+        seen.pop(url, None)
+        missed.pop(url, None)
+
+    tracking["seen"] = seen
+    tracking["missed"] = missed
+    save_tracking(tracking)
+
+    freshly_missed = [u for u, _ in freshly_missed_entries]
+    return freshly_missed, to_delete
+
+
+# ------------------------------------------------------------------ #
+# Progress file (resume support)
+# ------------------------------------------------------------------ #
 
 def load_progress() -> Dict[str, Any]:
-    """Load progress from file for resume capability."""
     if os.path.exists(PROGRESS_FILE):
         try:
             with open(PROGRESS_FILE, "r") as f:
@@ -68,28 +146,27 @@ def load_progress() -> Dict[str, Any]:
             logger.warning("Failed to load progress file, starting fresh")
     return {
         "processed_urls": [],
-        "skipped_urls": [],
         "failed_urls": [],
-        "total_scraped": 0,
-        "total_embedded": 0,
-        "total_uploaded": 0,
+        "total_new": 0,
+        "total_updated": 0,
+        "total_unchanged": 0,
+        "total_deleted": 0,
         "timestamp": None,
     }
 
 
 def save_progress(progress: Dict[str, Any]):
-    """Save progress to file."""
     progress["timestamp"] = datetime.now(timezone.utc).isoformat()
     with open(PROGRESS_FILE, "w") as f:
         json.dump(progress, f, indent=2)
 
 
+# ------------------------------------------------------------------ #
+# Embedding helpers
+# ------------------------------------------------------------------ #
+
 def build_info_text(product: Dict[str, Any]) -> str:
-    """Build comprehensive info text for text embedding.
-    
-    Includes all available product information: title, description, category,
-    gender, price, sale, brand, tags, size, country, and metadata summary.
-    """
+    """Build a comprehensive info string for text embedding."""
     parts = []
     if product.get("title"):
         parts.append(f"Title: {product['title']}")
@@ -112,238 +189,292 @@ def build_info_text(product: Dict[str, Any]) -> str:
     if product.get("country"):
         parts.append(f"Country: {product['country']}")
     if product.get("metadata"):
-        # Include key metadata fields (exclude the full variants array which is long)
         try:
             md = json.loads(product["metadata"])
-            summary_parts = []
+            summary = []
             if md.get("sku"):
-                summary_parts.append(f"SKU: {md['sku']}")
+                summary.append(f"SKU: {md['sku']}")
             if md.get("gtin"):
-                summary_parts.append(f"GTIN: {md['gtin']}")
+                summary.append(f"GTIN: {md['gtin']}")
             if md.get("aggregate_rating"):
-                rating = md['aggregate_rating']
-                rating_str = f"Rating: {rating.get('ratingValue', '?')}/5 ({rating.get('reviewCount', '0')} reviews)"
-                summary_parts.append(rating_str)
-            if summary_parts:
-                parts.append(" | ".join(summary_parts))
+                r = md["aggregate_rating"]
+                summary.append(f"Rating: {r.get('ratingValue', '?')}/5 ({r.get('reviewCount', '0')} reviews)")
+            if summary:
+                parts.append(" | ".join(summary))
         except (json.JSONDecodeError, TypeError):
             pass
-
     return " | ".join(parts)
 
 
-def process_product(
-    url: str,
-    db: Optional[DatabaseManager],
-    skip_embeddings: bool,
-) -> Optional[Dict[str, Any]]:
-    """Scrape a single product and optionally generate embeddings."""
-    product = scrape_product(url)
-    if not product:
-        return None
+def generate_embeddings_for_product(
+    product: Dict[str, Any],
+    needs_image_embed: bool,
+    needs_text_embed: bool,
+) -> Tuple[Optional[List[float]], Optional[List[float]]]:
+    """Generate requested embeddings for a product with staggered delay."""
+    time.sleep(EMBEDDING_DELAY)
 
-    if not skip_embeddings:
-        # Generate image embedding
+    image_emb = None
+    info_emb = None
+
+    if needs_image_embed and product.get("image_url"):
         image_emb = generate_image_embedding(product["image_url"])
-        if image_emb:
-            product["image_embedding"] = image_emb
+        time.sleep(EMBEDDING_DELAY)
 
-        # Generate text embedding from comprehensive info
+    if needs_text_embed:
         info_text = build_info_text(product)
         if info_text:
-            text_emb = generate_text_embedding(info_text)
-            if text_emb:
-                product["info_embedding"] = text_emb
+            info_emb = generate_text_embedding(info_text)
 
-    return product
+    return image_emb, info_emb
 
+
+# ------------------------------------------------------------------ #
+# Main pipeline
+# ------------------------------------------------------------------ #
 
 def run_scrape(
     limit: Optional[int] = None,
     skip_embeddings: bool = False,
     resume: bool = False,
-    skip_existing: bool = False,
 ):
-    """Run the full scraping pipeline."""
+    """Run the full smart scraping pipeline."""
+
+    # -- Init database --------------------------------------------------
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_KEY")
-
     if not supabase_url or not supabase_key:
-        logger.error(
-            "SUPABASE_URL and SUPABASE_KEY must be set in .env file"
-        )
+        logger.error("SUPABASE_URL and SUPABASE_KEY must be set in .env file")
         sys.exit(1)
 
-    # Initialize database manager
     db = DatabaseManager(supabase_url, supabase_key)
 
-    # Load progress if resuming
+    # -- Load state -----------------------------------------------------
+    tracking = load_tracking()
     progress = load_progress() if resume else {
         "processed_urls": [],
-        "skipped_urls": [],
         "failed_urls": [],
-        "total_scraped": 0,
-        "total_embedded": 0,
-        "total_uploaded": 0,
+        "total_new": 0,
+        "total_updated": 0,
+        "total_unchanged": 0,
+        "total_deleted": 0,
         "timestamp": None,
     }
-
     processed_set = set(progress.get("processed_urls", []))
-    skipped_set = set(progress.get("skipped_urls", []))
     failed_set = set(progress.get("failed_urls", []))
 
-    # Get existing product IDs if skip_existing
-    existing_ids: Set[str] = set()
-    if skip_existing:
-        logger.info("Fetching existing product IDs from database...")
-        existing_ids = db.get_existing_ids()
-        logger.info("Found %d existing products", len(existing_ids))
-
-    # Step 1: Collect all product URLs
+    # -- Step 1: Collect all product URLs --------------------------------
     logger.info("=" * 60)
     logger.info("STEP 1: Collecting product URLs from collection pages")
     logger.info("=" * 60)
-
     all_urls = scrape_all_product_urls()
     if not all_urls:
         logger.error("No product URLs found. Exiting.")
         sys.exit(1)
-
     logger.info("Found %d total product URLs", len(all_urls))
 
-    # Filter out already processed URLs
+    # Filter out already-processed / failed URLs
     urls_to_process = [
         u for u in all_urls
-        if u not in processed_set
-        and u not in skipped_set
-        and u not in failed_set
+        if u not in processed_set and u not in failed_set
     ]
-
     if not urls_to_process:
         logger.info("All URLs have already been processed!")
         return
 
-    # Apply limit
     if limit and limit > 0:
         urls_to_process = urls_to_process[:limit]
 
-    logger.info(
-        "Processing %d new URLs (already processed: %d, skipped: %d, failed: %d)",
-        len(urls_to_process),
-        len(processed_set),
-        len(skipped_set),
-        len(failed_set),
-    )
+    logger.info("Processing %d URLs", len(urls_to_process))
 
-    # Step 2: Process each product
+    # -- Step 2: Fetch existing products from DB -------------------------
     logger.info("=" * 60)
-    logger.info("STEP 2: Scraping products and generating embeddings")
+    logger.info("STEP 2: Fetching existing products from database")
+    logger.info("=" * 60)
+    existing_products = db.fetch_existing_products(SOURCE_NAME)
+    all_source_urls_in_db: Set[str] = set(existing_products.keys())
+
+    # Pre-classify each URL before scraping
+    classification: Dict[str, Tuple[str, bool]] = {}
+    for url in urls_to_process:
+        existing = existing_products.get(url)
+        if existing is None:
+            classification[url] = (ProductStatus.NEW, True)
+        else:
+            # We'll properly classify after scraping (we need scraped data)
+            # For now, mark as "unknown" — we classify after scraping
+            classification[url] = ("pending", False)
+
+    # -- Step 3: Process each product ------------------------------------
+    logger.info("=" * 60)
+    logger.info("STEP 3: Scraping, comparing, and embedding products")
     logger.info("=" * 60)
 
-    pbar = tqdm(urls_to_process, desc="Processing products", unit="product")
-    batch_products: List[Dict[str, Any]] = []
+    pbar = tqdm(urls_to_process, desc="Processing", unit="product")
+
+    # Collectors
+    newly_scraped: Dict[str, Dict[str, Any]] = {}
+    updated_scraped: Dict[str, Dict[str, Any]] = {}
+    unchanged_urls: List[str] = []
+    seen_this_run: Set[str] = set()
+    failed_urls_run: List[str] = []
+    batch_for_db: List[Dict[str, Any]] = []
+
+    new_count = 0
+    updated_count = 0
+    unchanged_count = 0
 
     for idx, url in enumerate(pbar):
-        # Check if product already exists in DB
-        product_id = None
-        if skip_existing:
-            # Generate product ID the same way as in product.py
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            handle = parsed.path.rstrip("/").split("/")[-1]
-            product_id = f"equalite-{handle}"
-            if product_id in existing_ids:
-                pbar.set_description(f"Skipping existing: {handle}")
-                progress["skipped_urls"].append(url)
-                continue
+        short = url.split("/")[-1][:45]
+        seen_this_run.add(url)
 
-        pbar.set_description(f"Processing: {url.split('/')[-1][:40]}")
-
+        # ---- Scrape ----
         try:
-            product = process_product(url, db, skip_embeddings)
+            product = scrape_product(url)
         except Exception as e:
-            logger.error("Unexpected error processing %s: %s", url, e)
-            progress["failed_urls"].append(url)
-            save_progress(progress)
+            logger.error("Error scraping %s: %s", url, e)
+            failed_urls_run.append(url)
             continue
 
         if product is None:
-            progress["failed_urls"].append(url)
-            save_progress(progress)
+            failed_urls_run.append(url)
             continue
 
-        # If skip_existing, double-check by product ID
-        if skip_existing and product_id and product_id in existing_ids:
-            progress["skipped_urls"].append(url)
-            continue
+        # ---- Compare with existing DB record ----
+        existing = existing_products.get(url)
+        status, image_changed = db.classify_product(product, existing)
 
-        progress["total_scraped"] += 1
-        if not skip_embeddings and product.get("image_embedding"):
-            progress["total_embedded"] += 1
+        if status == ProductStatus.UNCHANGED:
+            unchanged_count += 1
+            unchanged_urls.append(url)
+            pbar.set_description(f"Unchanged: {short}")
+            continue  # Skip entirely — no DB update, no embeddings
 
-        batch_products.append(product)
-        progress["processed_urls"].append(url)
-
-        # Batch upload to database
-        if len(batch_products) >= BATCH_SIZE:
-            upload_batch(batch_products, db, progress)
-            batch_products = []
-
-        # Save progress periodically
-        if (idx + 1) % BATCH_SIZE == 0:
-            save_progress(progress)
-
-    # Upload remaining products
-    if batch_products:
-        upload_batch(batch_products, db, progress)
-
-    # Final progress save
-    save_progress(progress)
-
-    # Print summary
-    print()
-    logger.info("=" * 60)
-    logger.info("SCRAPING COMPLETE")
-    logger.info("=" * 60)
-    logger.info("Total URLs found:     %d", len(all_urls))
-    logger.info("Products scraped:     %d", progress["total_scraped"])
-    logger.info("Products embedded:    %d", progress["total_embedded"])
-    logger.info("Products uploaded:    %d", progress["total_uploaded"])
-    logger.info("Failed URLs:          %d", len(progress.get("failed_urls", [])))
-    logger.info("Skipped (existing):   %d", len(progress.get("skipped_urls", [])))
-    logger.info("=" * 60)
-
-
-def upload_batch(
-    batch_products: List[Dict[str, Any]],
-    db: DatabaseManager,
-    progress: Dict[str, Any],
-):
-    """Upload a batch of products to Supabase."""
-    try:
-        success, failed = db.batch_upsert(batch_products)
-        progress["total_uploaded"] += success
-        if failed > 0:
-            logger.warning(
-                "Batch upload: %d succeeded, %d failed",
-                success,
-                failed,
+        # ---- Generate embeddings (if needed) ----
+        if not skip_embeddings:
+            needs_image = status == ProductStatus.NEW or image_changed
+            needs_text = True  # always generate text embedding for new/changed
+            img_emb, txt_emb = generate_embeddings_for_product(
+                product, needs_image, needs_text,
             )
-    except Exception as e:
-        logger.error("Batch upload error: %s", e)
-        progress["failed_urls"].extend(
-            [p["product_url"] for p in batch_products]
+            if img_emb is not None:
+                product["image_embedding"] = img_emb
+            if txt_emb is not None:
+                product["info_embedding"] = txt_emb
+        else:
+            img_emb, txt_emb = None, None
+
+        # ---- Collect for batch upsert ----
+        if status == ProductStatus.NEW:
+            new_count += 1
+            pbar.set_description(f"New: {short}")
+        else:
+            updated_count += 1
+            pbar.set_description(f"Updated: {short}")
+
+        batch_for_db.append(product)
+
+        # ---- Periodic batch upsert ----
+        if len(batch_for_db) >= DB_BATCH_SIZE:
+            success, fail, fail_urls = db.batch_upsert(batch_for_db)
+            if fail_urls:
+                failed_urls_run.extend(fail_urls)
+            batch_for_db = []
+
+        # ---- Periodic progress save ----
+        if (idx + 1) % PROGRESS_SAVE_INTERVAL == 0:
+            save_progress({
+                "processed_urls": list(seen_this_run - set(failed_urls_run)),
+                "failed_urls": failed_urls_run,
+                "total_new": new_count,
+                "total_updated": updated_count,
+                "total_unchanged": unchanged_count,
+                "total_deleted": progress["total_deleted"],
+                "timestamp": None,
+            })
+
+    pbar.close()
+
+    # -- Flush remaining batch ------------------------------------------
+    if batch_for_db:
+        success, fail, fail_urls = db.batch_upsert(batch_for_db)
+        if fail_urls:
+            failed_urls_run.extend(fail_urls)
+
+    # -- Step 4: Handle stale products ----------------------------------
+    logger.info("=" * 60)
+    logger.info("STEP 4: Checking for stale products")
+    logger.info("=" * 60)
+
+    freshly_missed, to_delete = update_tracking(
+        tracking, seen_this_run, all_source_urls_in_db,
+    )
+
+    deleted_count = 0
+    if to_delete:
+        logger.info(
+            "Deleting %d stale products (missed >= 2 runs): %s",
+            len(to_delete),
+            to_delete,
+        )
+        del_success, del_fail = db.delete_products_by_urls(to_delete)
+        deleted_count = del_success
+    else:
+        logger.info("No stale products to delete")
+
+    if freshly_missed:
+        logger.info(
+            "%d products missed this run (will be deleted if missed again): %s",
+            len(freshly_missed),
+            freshly_missed,
         )
 
+    # -- Save final progress ---------------------------------------------
+    save_progress({
+        "processed_urls": list(seen_this_run - set(failed_urls_run)),
+        "failed_urls": failed_urls_run,
+        "total_new": new_count,
+        "total_updated": updated_count,
+        "total_unchanged": unchanged_count,
+        "total_deleted": deleted_count,
+        "timestamp": None,
+    })
+
+    # -- Step 5: Run summary ---------------------------------------------
+    print()
+    logger.info("=" * 60)
+    logger.info("  RUN SUMMARY")
+    logger.info("=" * 60)
+    logger.info("  %-30s %d", "URLs discovered", len(all_urls))
+    logger.info("  %-30s %d", "New products added", new_count)
+    logger.info("  %-30s %d", "Products updated", updated_count)
+    logger.info("  %-30s %d", "Unchanged (skipped)", unchanged_count)
+    logger.info("  %-30s %d", "Stale products deleted", deleted_count)
+    logger.info("  %-30s %d", "Failed", len(failed_urls_run))
+    logger.info("  %-30s %d", "Products missed (1st run)",
+                len(freshly_missed))
+    logger.info("=" * 60)
+
+    # Log failed URLs if any
+    if failed_urls_run:
+        logger.warning("Failed URLs (%d):", len(failed_urls_run))
+        for fu in failed_urls_run:
+            logger.warning("  - %s", fu)
+
+
+# ------------------------------------------------------------------ #
+# CLI
+# ------------------------------------------------------------------ #
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Equalite Product Scraper - scrape all products and embed with SigLIP",
+        description="Equalité Product Scraper — smart pipeline with upsert, "
+                    "stale detection, and batch operations",
     )
     parser.add_argument(
         "--skip-embeddings",
         action="store_true",
-        help="Skip embedding generation (faster, for testing)",
+        help="Skip embedding generation entirely",
     )
     parser.add_argument(
         "--resume",
@@ -355,11 +486,6 @@ def main():
         type=int,
         default=None,
         help="Limit number of products to process (for testing)",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip products that already exist in the database",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -374,14 +500,12 @@ def main():
         logging.getLogger("src").setLevel(logging.DEBUG)
 
     logger.info(
-        "Starting Equalite Scraper (embeddings: %s, resume: %s, limit: %s, skip-existing: %s)",
+        "Starting Equalité Scraper (embeddings: %s, resume: %s, limit: %s)",
         "disabled" if args.skip_embeddings else "enabled",
         "yes" if args.resume else "no",
         args.limit if args.limit else "all",
-        "yes" if args.skip_existing else "no",
     )
 
-    # Warn about model loading time
     if not args.skip_embeddings:
         logger.info(
             "Note: First run will download the SigLIP model (~1GB). "
@@ -393,10 +517,12 @@ def main():
         limit=args.limit,
         skip_embeddings=args.skip_embeddings,
         resume=args.resume,
-        skip_existing=args.skip_existing,
     )
     elapsed = time.time() - start_time
-    logger.info("Total execution time: %.1f seconds (%.1f minutes)", elapsed, elapsed / 60)
+    logger.info(
+        "Total execution time: %.1f seconds (%.1f minutes)",
+        elapsed, elapsed / 60,
+    )
 
 
 if __name__ == "__main__":
