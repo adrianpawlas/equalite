@@ -139,7 +139,11 @@ def generate_image_embedding(image_url: str) -> Optional[List[float]]:
 
 @torch.no_grad()
 def generate_text_embedding(text: str) -> Optional[List[float]]:
-    """Generate a 768-dim text embedding using SigLIP text encoder."""
+    """Generate a 768-dim text embedding using SigLIP text encoder.
+
+    Note: SigLIP's text model has a max position embedding of 64 tokens,
+    so long inputs will be truncated.
+    """
     if not text or not text.strip():
         return None
 
@@ -147,9 +151,15 @@ def generate_text_embedding(text: str) -> Optional[List[float]]:
     device = get_device()
 
     try:
-        # Process text
-        inputs = processor(text=[text], return_tensors="pt", padding=True)
-        
+        # Truncate to SigLIP's max position (64 tokens) via the processor
+        inputs = processor(
+            text=[text],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=64,
+        )
+
         # Move inputs to device
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs.get("attention_mask")
@@ -161,13 +171,13 @@ def generate_text_embedding(text: str) -> Optional[List[float]]:
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        
+
         if hasattr(text_outputs, 'pooler_output'):
             text_features = text_outputs.pooler_output
         else:
             # Fallback: use last hidden state pooled
             text_features = text_outputs.last_hidden_state[:, 0, :]
-        
+
         # L2 normalize
         text_features = F.normalize(text_features, p=2, dim=-1)
 
