@@ -7,3 +7,4 @@ dist/
 build/
 .scraper_progress.json
 images/
+logs/
