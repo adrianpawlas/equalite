@@ -1,61 +1,47 @@
-name: Equalité Scraper
+name: Equalite Scraper
 
 on:
-  # Manual trigger from the GitHub Actions UI
   workflow_dispatch:
     inputs:
       limit:
-        description: 'Number of products to scrape (leave empty for all)'
+        description: Number of products to scrape (leave empty for all)
         required: false
         type: string
         default: ''
       skip_embeddings:
-        description: 'Skip image/text embeddings (faster)'
+        description: Skip image/text embeddings (faster)
         required: false
         type: boolean
         default: false
       skip_existing:
-        description: 'Only scrape products not already in database'
+        description: Only scrape products not already in database
         required: false
         type: boolean
         default: false
-
-  # Scheduled run — every Saturday at 1:00 PM UTC
   schedule:
     - cron: '0 13 * * 6'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Verify model downloads (warm cache)
+      - name: Download SigLIP model (warm cache)
         run: |
-          python -c "
-from transformers import AutoModel, AutoProcessor
-print('Downloading SigLIP model...')
-AutoModel.from_pretrained('google/siglip-base-patch16-384')
-AutoProcessor.from_pretrained('google/siglip-base-patch16-384')
-print('Model ready')
-"
+          python3 -c "from transformers import AutoModel, AutoProcessor; AutoModel.from_pretrained('google/siglip-base-patch16-384'); AutoProcessor.from_pretrained('google/siglip-base-patch16-384'); print('model ready')"
 
       - name: Run scraper
         run: |
@@ -69,10 +55,10 @@ print('Model ready')
           if [ "${{ github.event.inputs.skip_existing }}" = "true" ]; then
             ARGS="$ARGS --skip-existing"
           fi
-          python scraper.py $ARGS
+          python3 scraper.py $ARGS
         timeout-minutes: 30
 
-      - name: Upload run log on failure
+      - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
